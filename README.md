@@ -39,8 +39,8 @@ To install all dependencies, follow the following steps.
 
 You could use the same virtual environment (`HDN.yml`) as used by us by following the steps below.
  
-1. Clone the repository locally by using the command `git clone https://github.com/juglab/HDN_RC.git`
-2. Move into the cloned folder by using the command `cd HDN_RC`. 
+1. Clone the repository locally by using the command `git clone https://github.com/juglab/HDN.git`
+2. Move into the cloned folder by using the command `cd HDN`. 
 3. Create a new environment by entering the python command in the terminal `conda env create -f HDN.yml`. This will install all dependencies needed to run the notebooks.
 4. Then run the command `conda activate HDN`.
 5. After this, run the command `pip install ipykernel`.
