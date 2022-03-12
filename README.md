@@ -1,4 +1,4 @@
-# Removing Pixel Noises and Structured Artefacts Using Generative Diversity Denoising Methods
+# Interpretable Unsupervised Diversity Denoising and Artefact Removal 
 
 Mangal Prakash<sup>1,2</sup>, Mauricio Delbracio<sup>3</sup>, Peyman Milanfar<sup>3</sup>, Florian Jug<sup>1,2,4</sup></br>
 <sup>1</sup>Max Planck Institute of Molecular Cell Biology and Genetics (**[MPI-CBG](https://www.mpi-cbg.de/home/)**) <br>
@@ -20,7 +20,7 @@ Finally, we offer insights into the daunting question of how GDD methods disting
 
 ### Information
 
-This repository hosts the the code for the **[publication](https://openreview.net/forum?id=DfMqlB0PXjM&referrer=%5BAuthor%20Console%5D(%2Fgroup%3Fid%3DICLR.cc%2F2022%2FConference%2FAuthors%23your-submissions))** **Removing Pixel Noises and Spatial Artefacts with Generative Diversity Denoising Methods**. 
+This repository hosts the the code for the **[publication](https://openreview.net/forum?id=DfMqlB0PXjM&referrer=%5BAuthor%20Console%5D(%2Fgroup%3Fid%3DICLR.cc%2F2022%2FConference%2FAuthors%23your-submissions))** **Interpretable Unsupervised Diversity Denoising and Artefact Removal **. 
 
 ### Citation
 If you find our work useful in your research, please consider citing:
