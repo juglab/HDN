@@ -20,17 +20,19 @@ Finally, we offer insights into the daunting question of how GDD methods disting
 
 ### Information
 
-This repository hosts the the code for the **[publication](https://arxiv.org/pdf/2104.01374.pdf)** **Removing Pixel Noises and Spatial Artefacts with Generative Diversity Denoising Methods**. 
+This repository hosts the the code for the **[publication](https://openreview.net/forum?id=DfMqlB0PXjM&referrer=%5BAuthor%20Console%5D(%2Fgroup%3Fid%3DICLR.cc%2F2022%2FConference%2FAuthors%23your-submissions))** **Removing Pixel Noises and Spatial Artefacts with Generative Diversity Denoising Methods**. 
 
 ### Citation
 If you find our work useful in your research, please consider citing:
 
 ```
-@article{prakash2021removing,
-  title={Removing Pixel Noises and Spatial Artifacts with Generative Diversity Denoising Methods},
-  author={Prakash, Mangal and Delbracio, Mauricio and Milanfar, Peyman and Jug, Florian},
-  journal={arXiv preprint arXiv:2104.01374},
-  year={2021}
+@inproceedings{
+prakash2022interpretable,
+title={Interpretable Unsupervised Diversity Denoising and Artefact Removal},
+author={Mangal Prakash and Mauricio Delbracio and Peyman Milanfar and Florian Jug},
+booktitle={International Conference on Learning Representations},
+year={2022},
+url={https://openreview.net/forum?id=DfMqlB0PXjM}
 }
 ```
 
