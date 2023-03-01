@@ -1,9 +1,11 @@
 import os
 import torch
+import logging
+import tifffile
 import numpy as np
 from pathlib import Path
-from tifffile import imread
 from torch.utils.data import Dataset, DataLoader
+from typing import List, Tuple, Union, Optional, Callable
 
 import lib.utils as utils
 
@@ -61,22 +63,114 @@ def _make_datamanager(train_images, val_images, test_images, batch_size, test_ba
     return train_loader, val_loader, test_loader, data_mean, data_std
 
 
-class HDNDataset(Dataset):
+class CustomGridPatchDataset(torch.utils.data.IterableDataset):
+    """Dataset to extract patches from a list of images and apply transforms to the patches.
+    """
+    #TODO add napari style axes params, add asserts
+    def __init__(
+        self,
+        data_path: List[str],
+        patch_size: Tuple[int],
+        patch_iter: Union[np.ndarray, Callable],
+        image_level_transform: Optional[Callable] = None,
+        patch_level_transform: Optional[Callable] = None,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        data_path : List[str]
+            List of filenames to read image data from.
+        patch_size : Tuple[int]
+            The size of the patch to extract from the image. Must be a tuple of len either 2 or 3 depending on number of spatial dimension in the data.
+        patch_iter : Union[np.ndarray, Callable]
+            converts an input image (item from dataset) into a iterable of image patches.
+            `patch_iter(dataset[idx])` must yield a tuple: (patches, coordinates).
+        image_level_transform : Optional[Callable], optional
+            _description_, by default None
+        patch_level_transform : Optional[Callable], optional
+            _description_, by default None
+        """
+        # super().__init__(data=data, transform=None)
+        self.data = data_path
+        self.patch_size = patch_size
+        self.patch_iter = patch_iter
+        self.image_transform = image_level_transform
+        self.patch_transform = patch_level_transform
 
-    def __init__(self, path, patch_size,  augment=True, filenames='*'):
+        #Assert input data
+        assert isinstance(data_path, list), f'Incorrect patch_size. Must be a tuple, given{type(data_path)}'
+        assert len(data_path) > 0, 'Data source is empty'
 
-        self.data = np.concatenate([imread(f) for f in Path(path).rglob((f'{filenames}.tif*'))], 0)
-        self.augment = augment
-        #TODO handle axes 
-
-    def __len__(self):
-        return self.data.shape[0] * 8 # TODO calculate number of patches
+        #Assert patch_size
+        assert isinstance(patch_size, tuple), f'Incorrect patch_size. Must be a tuple, given{type(patch_size)}'
+        assert len(patch_size) in (2, 3), f'Incorrect patch_size. Must be a 2 or 3, given{len(patch_size)}'
     
-    def __getitem__(self, idx):
-        patches = utils.extract_patches() # TODO Replace with view as windows ?
-        if self.augment:
-            patches = utils.augment_data() 
-        
-        #TODO custom collate/sampler to mix patches from different slices !
+    @staticmethod
+    def read_data_source(self, data_source: str):
+        """
+        Read data source and correct dimensions
 
-        return ''
+        Parameters
+        ----------
+        data_source : str
+            Path to data source
+        
+        Returns
+        -------
+        image volume : np.ndarray
+        """
+
+        if not os.path.exists(data_source):
+            raise ValueError(f"Data source {data_source} does not exist")
+
+        arr = tifffile.imread(data_source)
+        # Assert data dimensions are correct
+        assert len(arr.shape) in (2, 3, 4), f'Incorrect data dimensions. Must be 2, 3 or 4, given {arr.shape} for file {data_source}'
+
+        # Adding channel dimension if necessary. If present, check correctness
+        if len(arr.shape) == 2 or (len(arr.shape) == 3 and len(self.patch_size) == 3):
+            arr = np.expand_dims(arr, axis=0)
+        elif len(arr.shape) == 3 and len(self.patch_size) == 2 and arr.shape[0] > 4:
+            raise ValueError(f'Incorrect number of channels {arr.shape[0]}')
+        elif len(arr.shape) > 3 and len(self.patch_size) == 2:
+            raise ValueError(f'Incorrect data dimensions {arr.shape} for given dimensionality {len(self.patch_size)}D in file {data_source}')
+        #TODO add other asserts
+        return arr
+        
+
+    def __iter_source__(self):
+        """
+        Iterate over data source and yield whole image. Optional transform is applied to the images.
+
+        Yields
+        ------
+        np.ndarray
+        """
+        info = torch.utils.data.get_worker_info()
+        num_workers = info.num_workers if info is not None else 1
+        id = info.id if info is not None else 0
+        self.source = iter(self.data)
+        #TODO check for mem leaks, explicitly gc the arr after iterator is exhausted
+        for i, filename in enumerate(self.source):
+            try:
+                arr = self.read_data_source(self, filename)
+            except (ValueError, FileNotFoundError, OSError) as e:
+                logging.exception(f'Exception in file {filename}, skipping')
+                raise e
+            if i % num_workers == id:
+                yield self.image_transform(arr) if self.image_transform is not None else arr
+
+    def __iter__(self):
+        """
+        Iterate over data source and yield single patch. Optional transform is applied to the patches.
+
+        Yields
+        ------
+        np.ndarray
+        """
+        for image in self.__iter_source__():
+            for patch in  self.patch_iter(image, self.patch_size):
+                #TODO add patch manip n2v 
+                yield self.patch_transform(patch) if self.patch_transform is not None else patch
+
+
