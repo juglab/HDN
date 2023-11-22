@@ -1,14 +1,30 @@
 import numpy as np
 import torch
 from torch import nn
-
-from lib.likelihoods import (GaussianLikelihood,
-                             NoiseModelLikelihood)
+from typing import Type, Union
+import math
+import matplotlib.pyplot as plt
+from lib.likelihoods import *
 from lib.utils import (crop_img_tensor, pad_img_tensor, Interpolate, free_bits_kl)
 from .lvae_layers import (TopDownLayer, BottomUpLayer,
                           TopDownDeterministicResBlock,
                           BottomUpDeterministicResBlock)
 
+
+#add positional encoding to each conv layer
+class SinusoidalPositionEmbeddings(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, time):
+        device = time.device
+        half_dim = self.dim // 2 
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
+        embeddings = time[:, None] * embeddings[None, :]
+        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+        return embeddings
 
 class LadderVAE(nn.Module):
 
@@ -17,35 +33,49 @@ class LadderVAE(nn.Module):
                  device,                 
                  data_mean,
                  data_std,
+                 blocks_per_layer,
+                 n_filters,
                  color_ch=1,
                  noiseModel=None,
-                 blocks_per_layer=5,
-                 nonlin='elu',
+                 conv_mult=2,
+                 nonlin=nn.ELU,
                  merge_type='residual',
                  batchnorm=True,
                  stochastic_skip=True,
-                 n_filters=64,
                  dropout=0.2,
                  free_bits=0.0,
                  learn_top_prior=True,
                  img_shape=None,
                  res_block_type='bacdbacd',
                  gated=True,
+                 grad_checkpoint=False,
                  no_initial_downscaling=True,
                  analytical_kl=True,
                  mode_pred=False,
-                 use_uncond_mode_at=[]):
+                 use_uncond_mode_at=[],
+                 likelihood_form='GaussianLikelihood', 
+                 logvar_clip = -1,
+                 lvclip=False, 
+                 lvtype='pixelwise',
+                 stochasticity=True):
+        
         super().__init__()
         self.color_ch = color_ch
         self.z_dims = z_dims
         self.blocks_per_layer = blocks_per_layer
+        # Get class of convolutional layer
+        self.conv_mult = conv_mult
+        self.conv_type: Type[Union[nn.Conv2d, nn.Conv3d]] = getattr(nn, f'Conv{self.conv_mult}d')
+        self.up_conv_type: Type[Union[nn.ConvTranspose2d, nn.ConvTranspose3d]] = getattr(nn, f'ConvTranspose{self.conv_mult}d')
+        # Get class of nonlinear activation from string description
+        self.nonlin: Type[Union[nn.ReLU, nn.LeakyReLU, nn.ELU, nn.SELU]] = nonlin
         self.n_layers = len(self.z_dims)
         self.stochastic_skip = stochastic_skip
         self.n_filters = n_filters
         self.dropout = dropout
         self.free_bits = free_bits
         self.learn_top_prior = learn_top_prior
-        self.img_shape = tuple(img_shape)
+        self.input_array_shape = tuple(img_shape)
         self.res_block_type = res_block_type
         self.gated = gated
         self.device = device
@@ -56,14 +86,19 @@ class LadderVAE(nn.Module):
         self.use_uncond_mode_at=use_uncond_mode_at
         self._global_step = 0
         
-        assert(self.data_std is not None)
-        assert(self.data_mean is not None)
-        if self.noiseModel is None:
-            self.likelihood_form = "gaussian"
-        else:
-            self.likelihood_form = "noise_model"
+        self.likelihood_form = likelihood_form
+        self.logvar_clip = logvar_clip
+        self.lvclip = lvclip
+        self.lvtype = lvtype
+        self.stochasticity = stochasticity
+
+        assert self.data_std is not None, 'Data std is not specified'
+        assert self.data_mean is not None, 'Data mean is not specified'
+        assert self.conv_mult in [2, 3], 'Please specify correct conv layers dimension, 2 or 3'
+        assert self.color_ch in [1, 3], 'Please specify correct number of input channels'
         
         self.downsample = [1]*self.n_layers
+
 
         # Downsample by a factor of 2 at each downsampling operation
         self.overall_downscale_factor = np.power(2, sum(self.downsample))
@@ -73,27 +108,21 @@ class LadderVAE(nn.Module):
         assert max(self.downsample) <= self.blocks_per_layer
         assert len(self.downsample) == self.n_layers
 
-        # Get class of nonlinear activation from string description
-        nonlin = {
-            'relu': nn.ReLU,
-            'leakyrelu': nn.LeakyReLU,
-            'elu': nn.ELU,
-            'selu': nn.SELU,
-        }[nonlin]
-
         # First bottom-up layer: change num channels + downsample by factor 2
         # unless we want to prevent this
         stride = 1 if no_initial_downscaling else 2
         self.first_bottom_up = nn.Sequential(
-            nn.Conv2d(color_ch, n_filters, 5, padding=2, stride=stride),
-            nonlin(),
+            self.conv_type(color_ch, n_filters[0], 5, padding=2, stride=stride),
+            self.nonlin(),
             BottomUpDeterministicResBlock(
-                c_in=n_filters,
-                c_out=n_filters,
-                nonlin=nonlin,
+                c_in=n_filters[0],
+                c_out=n_filters[0],
+                conv_mult=self.conv_mult,
+                nonlin=self.nonlin,
                 batchnorm=batchnorm,
                 dropout=dropout,
                 res_block_type=res_block_type,
+                grad_checkpoint=grad_checkpoint
             ))
 
         # Init lists of layers
@@ -111,13 +140,16 @@ class LadderVAE(nn.Module):
             self.bottom_up_layers.append(
                 BottomUpLayer(
                     n_res_blocks=self.blocks_per_layer,
-                    n_filters=n_filters,
-                    downsampling_steps=self.downsample[i],
-                    nonlin=nonlin,
+                    n_filters_in=n_filters[i],
+                    n_filters_out=n_filters[i+1],
+                    downsampling_steps=self.downsample[i],   
+                    conv_mult=self.conv_mult,
+                    nonlin=self.nonlin,
                     batchnorm=batchnorm,
                     dropout=dropout,
                     res_block_type=res_block_type,
                     gated=gated,
+                    grad_checkpoint=grad_checkpoint
                 ))
 
             # Add top-down stochastic layer at level i.
@@ -136,19 +168,23 @@ class LadderVAE(nn.Module):
                 TopDownLayer(
                     z_dim=z_dims[i],
                     n_res_blocks=blocks_per_layer,
-                    n_filters=n_filters,
+                    n_filters_in=n_filters[i+1],
+                    n_filters_out=n_filters[i],
                     is_top_layer=is_top,
                     downsampling_steps=self.downsample[i],
-                    nonlin=nonlin,
+                    conv_mult=self.conv_mult,
+                    nonlin=self.nonlin,
                     merge_type=merge_type,
                     batchnorm=batchnorm,
                     dropout=dropout,
                     stochastic_skip=stochastic_skip,
                     learn_top_prior=learn_top_prior,
-                    top_prior_param_shape=self.get_top_prior_param_shape(),
+                    top_prior_param_shape=self.get_top_prior_param_shape(dim=self.conv_mult),
                     res_block_type=res_block_type,
                     gated=gated,
+                    grad_checkpoint=grad_checkpoint,
                     analytical_kl=analytical_kl,
+                    stochasticity=self.stochasticity
                 ))
 
         # Final top-down layer
@@ -158,25 +194,26 @@ class LadderVAE(nn.Module):
         for i in range(blocks_per_layer):
             modules.append(
                 TopDownDeterministicResBlock(
-                    c_in=n_filters,
-                    c_out=n_filters,
-                    nonlin=nonlin,
+                    c_in=n_filters[0],
+                    c_out=n_filters[0],
+                    conv_mult=self.conv_mult,
+                    nonlin=self.nonlin,
                     batchnorm=batchnorm,
                     dropout=dropout,
                     res_block_type=res_block_type,
                     gated=gated,
+                    grad_checkpoint=grad_checkpoint
                 ))
-        self.final_top_down = nn.Sequential(*modules)
 
+            
+        self.final_top_down = nn.Sequential(*modules)
+        
         # Define likelihood
-        if self.likelihood_form == 'gaussian':
-            self.likelihood = GaussianLikelihood(n_filters, color_ch)
-        elif self.likelihood_form == 'noise_model':
-            self.likelihood = NoiseModelLikelihood(n_filters, color_ch, data_mean, 
-                                                   data_std, noiseModel)
-        else:
-            msg = "Unrecognized likelihood '{}'".format(likelihood_form)
-            raise RuntimeError(msg)
+        if self.likelihood_form == "GaussianLikelihood":
+            self.likelihood = GaussianLikelihood(n_filters[0], color_ch, logvar_clip, conv_mult, lvclip=self.lvclip, lv_type=self.lvtype)
+        elif self.likelihood_form == "GaussianLikelihood_HDN":
+            self.likelihood = GaussianLikelihood_HDN(n_filters[0], color_ch, conv_mult)
+
             
     def increment_global_step(self):
         """Increments global step by 1."""
@@ -187,11 +224,11 @@ class LadderVAE(nn.Module):
         """Global step."""
         return self._global_step
 
-    def forward(self, x):
+    def forward(self, x,y):
         img_size = x.size()[2:]
 
-        # Pad input to make everything easier with conv strides
-        x_pad = self.pad_input(x)
+        # Pad input to make everything easier with conv strides      
+        x_pad = self.pad_input(x, self.conv_mult)
 
         # Bottom-up inference: return list of length n_layers (bottom to top)
         bu_values = self.bottomup_pass(x_pad)
@@ -201,28 +238,27 @@ class LadderVAE(nn.Module):
 
         # Restore original image size
         out = crop_img_tensor(out, img_size)
-        
-        # Log likelihood and other info (per data point)
-        ll, likelihood_info = self.likelihood(out, x)
 
-        if self.mode_pred is False:
+        # Log likelihood and other info (per data point)
+        ll, likelihood_info = self.likelihood(out,y)
+
+        if self.stochasticity is True and self.mode_pred is False:
             # kl[i] for each i has length batch_size
             # resulting kl shape: (batch_size, layers)
-            kl = torch.cat([kl_layer.unsqueeze(1) for kl_layer in td_data['kl']],
-                           dim=1)
-
+            kl = torch.cat([kl_layer.unsqueeze(1) for kl_layer in td_data['kl']], dim=1)
             kl_sep = kl.sum(1)
             kl_avg_layerwise = kl.mean(0)
             kl_loss = free_bits_kl(kl, self.free_bits).sum()  # sum over layers
             kl = kl_sep.mean()
         else:
-            kl = None
             kl_sep = None
             kl_avg_layerwise = None
             kl_loss = None
             kl = None
-            
+
         output = {
+            'top_bu': bu_values,
+            'out_img': likelihood_info['sample'],   
             'll': ll,
             'z': td_data['z'],
             'kl': kl,
@@ -250,7 +286,7 @@ class LadderVAE(nn.Module):
             bu_values.append(x)
 
         return bu_values
-
+    
     def topdown_pass(self,
                      bu_values=None,
                      n_img_prior=None,
@@ -278,9 +314,10 @@ class LadderVAE(nn.Module):
             msg = ("Prior experiments (e.g. sampling from mode) are not"
                    " compatible with inference mode")
             raise RuntimeError(msg)
-
+        
         # Sampled latent variables at each layer
         z = [None] * self.n_layers
+
 
         # KL divergence of each layer
         kl = [None] * self.n_layers
@@ -302,7 +339,7 @@ class LadderVAE(nn.Module):
             try:
                 bu_value = bu_values[i]
             except TypeError:
-                bu_value = None
+                bu_value = None 
 
             # Whether the current layer should be sampled from the mode
             use_mode = i in mode_layers
@@ -325,16 +362,16 @@ class LadderVAE(nn.Module):
                 mode_pred=self.mode_pred,
                 use_uncond_mode=use_uncond_mode
             )
+
             z[i] = aux['z']  # sampled variable at this layer (batch, ch, h, w)
             kl[i] = aux['kl_samplewise']  # (batch, )
             kl_spatial[i] = aux['kl_spatial']  # (batch, h, w)
-            if self.mode_pred is False:
-                logprob_p += aux['logprob_p'].mean()  # mean over batch
-            else:
-                logprob_p = None
+            #if self.mode_pred is False:
+            #    logprob_p += aux['logprob_p'].mean()  # mean over batch
+            #else:
+            #    logprob_p = None
         # Final top-down layer
         out = self.final_top_down(out)
-
         data = {
             'z': z,  # list of tensors with shape (batch, ch[i], h[i], w[i])
             'kl': kl,  # list of tensors with shape (batch, )
@@ -343,60 +380,127 @@ class LadderVAE(nn.Module):
             'logprob_p': logprob_p,  # scalar, mean over batch
         }
         return out, data
-
-    def pad_input(self, x):
+    
+   
+    def pad_input(self, x, dim):
         """
         Pads input x so that its sizes are powers of 2
         :param x:
         :return: Padded tensor
         """
-        size = self.get_padded_size(x.size())
+        size = self.get_padded_size(x.size(), dim) #TODO check !
         x = pad_img_tensor(x, size)
+
         return x
 
-    def get_padded_size(self, size):
+    def get_padded_size(self, size, dim):
         """
         Returns the smallest size (H, W) of the image with actual size given
         as input, such that H and W are powers of 2.
-        :param size: input size, tuple either (N, C, H, w) or (H, W)
+        :param size: input size, tuple either (N, C, H, W) or (N, C, Z, H, W) or (H, W) or (Z, H, W)
         :return: 2-tuple (H, W)
         """
-
-        # Overall downscale factor from input to top layer (power of 2)
+        #TODO check!!!
+        # Overall downscale factor from input to top layer (power of 2)   
         dwnsc = self.overall_downscale_factor
-
-        # Make size argument into (heigth, width)
-        if len(size) == 4:
-            size = size[2:]
-        if len(size) != 2:
-            msg = ("input size must be either (N, C, H, W) or (H, W), but it "
-                   "has length {} (size={})".format(len(size), size))
+        # Make size argument into (heigth, width) or (depth, heigth, width)
+        if len(size) in [2, 3, 4, 5]:
+            size = size[-dim:]
+        else:
+            msg = f"input size must be either (N, C, H, W) or (N, C, Z, H, W) or (H, W) or (Z, H, W), but it " \
+                  f"has length {len(size)} (size={size})"
             raise RuntimeError(msg)
 
         # Output smallest powers of 2 that are larger than current sizes
         padded_size = list(((s - 1) // dwnsc + 1) * dwnsc for s in size)
-
         return padded_size
 
     def sample_prior(self, n_imgs, mode_layers=None, constant_layers=None):
-
+        """
+        Sample from the prior distribution of the model
+        :param n_imgs: Number of images to sample
+        :param mode_layers: List of layers for which to sample from the mode
+        :param constant_layers: List of layers for which to sample from the
+            mode and keep the output constant
+        :return: Tensor of shape (n_imgs, C, H, W) or (n_imgs, C, Z, H, W)
+        """
         # Generate from prior
         out, _ = self.topdown_pass(n_img_prior=n_imgs,
                                    mode_layers=mode_layers,
                                    constant_layers=constant_layers)
-        out = crop_img_tensor(out, self.img_shape)
+        out = crop_img_tensor(out, self.input_array_shape)
 
         # Log likelihood and other info (per data point)
         _, likelihood_data = self.likelihood(out, None)
 
         return likelihood_data['sample']
+    
 
-    def get_top_prior_param_shape(self, n_imgs=1):
+    def sample_prior_forced_latents(self, n_imgs, z_values, mode_layers=None, constant_layers=None):
+        """
+        Sample from the prior distribution of the model
+        :param n_imgs: Number of images to sample
+        :param mode_layers: List of layers for which to sample from the mode
+        :param constant_layers: List of layers for which to sample from the
+            mode and keep the output constant
+        :return: Tensor of shape (n_imgs, C, H, W) or (n_imgs, C, Z, H, W)
+        """
+        # Generate from prior
+        out, _ = self.topdown_pass(n_img_prior=n_imgs,
+                                   mode_layers=mode_layers,
+                                   constant_layers=constant_layers,
+                                   forced_latent=z_values)
+        out = crop_img_tensor(out, self.input_array_shape)
+
+        # Log likelihood and other info (per data point)
+        _, likelihood_data = self.likelihood(out, None)
+
+        return likelihood_data['sample']    
+
+    def get_top_prior_param_shape(self, dim, n_imgs=1):
         # TODO num channels depends on random variable we're using
         dwnsc = self.overall_downscale_factor
-        sz = self.get_padded_size(self.img_shape)
-        h = sz[0] // dwnsc
-        w = sz[1] // dwnsc
+        sz = self.get_padded_size(self.input_array_shape, dim)
         c = self.z_dims[-1] * 2  # mu and logvar
-        top_layer_shape = (n_imgs, c, h, w)
+        if self.conv_mult == 2:
+            h = sz[0] // dwnsc
+            w = sz[1] // dwnsc
+            top_layer_shape = (n_imgs, c, h, w)
+        elif self.conv_mult == 3:
+            z = sz[0] // dwnsc
+            h = sz[1] // dwnsc
+            w = sz[2] // dwnsc
+            assert len(self.input_array_shape) >= 3, 'Depth dimension not specified for input array'
+            top_layer_shape = (n_imgs, c, z, h, w)
+        else:
+            raise AssertionError('Incorrect conv layer dimensions')
         return top_layer_shape
+
+    def sample_prior_with_top_bu_value(self,
+                                       n_imgs, 
+                                       top_bu_value, 
+                                       mode_layers=None, 
+                                       constant_layers=None):
+        """
+        Sample from the prior distribution of the model, using a given value
+        for the top layer
+        :param top_bu_value: Value for the top layer
+        :param mode_layers: List of layers for which to sample from the mode
+        :param constant_layers: List of layers for which to sample from the
+            mode and keep the output constant
+        :return: Tensor of shape (n_imgs, C, H, W) or (n_imgs, C, Z, H, W)
+        """
+        # Generate from prior
+        out, _ = self.topdown_pass_new(n_img_prior=1,
+                                   mode_layers=mode_layers,
+                                   constant_layers=constant_layers,
+                                   forced_latent=None,
+                                   bu_values=[None,None,None,None,top_bu_value],
+                                   start_layer=4)                                        
+
+        out = crop_img_tensor(out, self.input_array_shape)
+
+        # Log likelihood and other info (per data point)
+        _, likelihood_data = self.likelihood(out, None)
+
+        return likelihood_data['sample']
