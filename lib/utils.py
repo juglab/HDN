@@ -5,7 +5,9 @@ from torch import nn
 from tqdm import tqdm
 from glob import glob
 from sklearn.feature_extraction import image
+from skimage.util import view_as_windows
 from matplotlib import pyplot as plt
+
 
 class Interpolate(nn.Module):
     """Wrapper for torch.nn.functional.interpolate."""
@@ -30,6 +32,7 @@ class Interpolate(nn.Module):
                             align_corners=self.align_corners)
         return out
     
+
 class CropImage(nn.Module):
     """Crops image to given size.
     Args:
@@ -58,6 +61,7 @@ def normalize(img, mean, std):
         """
     return (img - mean)/std
 
+
 def denormalize(img, mean, std):
     """Denormalize an array of images with mean and standard deviation. 
     Parameters
@@ -71,6 +75,7 @@ def denormalize(img, mean, std):
     """
     return (img * std) + mean
 
+
 def convertToFloat32(train_images,val_images):
     """Converts the data to float 32 bit type. 
     Parameters
@@ -83,6 +88,7 @@ def convertToFloat32(train_images,val_images):
     x_train = train_images.astype('float32')
     x_val = val_images.astype('float32')
     return x_train, x_val
+
 
 def getMeanStdData(train_images,val_images):
     """Compute mean and standrad deviation of data. 
@@ -99,6 +105,7 @@ def getMeanStdData(train_images,val_images):
     mean, std = np.mean(data), np.std(data)
     return mean, std
 
+
 def convertNumpyToTensor(numpy_array):
     """Convert numpy array to PyTorch tensor. 
     Parameters
@@ -108,24 +115,24 @@ def convertNumpyToTensor(numpy_array):
     """
     return torch.from_numpy(numpy_array)
 
-def augment_data(X_train):
-    """Augment data by 8-fold with 90 degree rotations and flips. 
-    Parameters
-    ----------
-    X_train: numpy array
-        Array of training images.
-    """
-    X_ = X_train.copy()
 
-    X_train_aug = np.concatenate((X_train, np.rot90(X_, 1, (1, 2))))
-    X_train_aug = np.concatenate((X_train_aug, np.rot90(X_, 2, (1, 2))))
-    X_train_aug = np.concatenate((X_train_aug, np.rot90(X_, 3, (1, 2))))
-    X_train_aug = np.concatenate((X_train_aug, np.flip(X_train_aug, axis=1)))
+def augment_data(patches):
+    if len(patches.shape[1:]) == 2:
+        augmented = np.concatenate((patches,
+                                    np.rot90(patches, k=1, axes=(1, 2)),
+                                    np.rot90(patches, k=2, axes=(1, 2)),
+                                    np.rot90(patches, k=3, axes=(1, 2))))
+    elif len(patches.shape[1:]) == 3:
+        augmented = np.concatenate((patches,
+                                    np.rot90(patches, k=1, axes=(2, 3)),
+                                    np.rot90(patches, k=2, axes=(2, 3)),
+                                    np.rot90(patches, k=3, axes=(2, 3))))
 
-    print('Raw image size after augmentation', X_train_aug.shape)
-    return X_train_aug
+    augmented = np.concatenate((augmented, np.flip(augmented, axis=-2)))
+    return augmented
 
-def extract_patches(x,patch_size,num_patches):
+
+def extract_patches(x, patch_size, num_patches):
     """Deterministically extract patches from array of images. 
     Parameters
     ----------
@@ -136,17 +143,22 @@ def extract_patches(x,patch_size,num_patches):
     num_patches: int
         Number of patches to be extracted from each image.    
     """
-    patches = np.zeros(shape=(x.shape[0]*num_patches,patch_size,patch_size))
+    patches = np.zeros(shape=(x.shape[0]*num_patches, patch_size, patch_size))
     
     for i in tqdm(range(x.shape[0])):
-        patches[i*num_patches:(i+1)*num_patches] = image.extract_patches_2d(x[i],(patch_size,patch_size), num_patches,
-                                                                           random_state=i)    
+        patches[i*num_patches:(i+1)*num_patches] = image.extract_patches_2d(image=x[i],
+                                                                            patch_size=(patch_size, patch_size),
+                                                                            max_patches=num_patches, 
+                                                                            random_state=i)    
+    
     return patches
+
+
 
 
 def crop_img_tensor(x, size) -> torch.Tensor:
     """Crops a tensor.
-    Crops a tensor of shape (batch, channels, h, w) to new height and width
+    Crops a tensor of shape (batch, channels, h, w) or (batch, channels, d, h, w) to new height and width
     given by a tuple.
     Args:
         x (torch.Tensor): Input image
@@ -159,35 +171,45 @@ def crop_img_tensor(x, size) -> torch.Tensor:
 
 def _pad_crop_img(x, size, mode) -> torch.Tensor:
     """ Pads or crops a tensor.
-    Pads or crops a tensor of shape (batch, channels, h, w) to new height
+    Pads or crops a tensor of shape (batch, channels, h, w) or (batch, channels, d, h, w) to new height
     and width given by a tuple.
     Args:
         x (torch.Tensor): Input image
-        size (list or tuple): Desired size (height, width)
+        size (list or tuple): Desired size (depth: opt, height, width)
         mode (str): Mode, either 'pad' or 'crop'
     Returns:
         The padded or cropped tensor
     """
-
-    assert x.dim() == 4 and len(size) == 2
+    assert x.dim() in [4, 5], 'Invalid input array dimension'
+    assert len(size) in [2, 3], 'Invalid input depth dimension'
+    # assert
     size = tuple(size)
-    x_size = x.size()[2:4]
+    x_size = x.size()[2:]
+
     if mode == 'pad':
-        cond = x_size[0] > size[0] or x_size[1] > size[1]
+        cond = any(x_size) > any(size)
     elif mode == 'crop':
-        cond = x_size[0] < size[0] or x_size[1] < size[1]
+        cond = any(x_size) < any(size)
     else:
-        raise ValueError("invalid mode '{}'".format(mode))
+        raise ValueError(f'invalid mode {mode}')
+
     if cond:
-        raise ValueError('trying to {} from size {} to size {}'.format(
-            mode, x_size, size))
-    dr, dc = (abs(x_size[0] - size[0]), abs(x_size[1] - size[1]))
-    dr1, dr2 = dr // 2, dr - (dr // 2)
-    dc1, dc2 = dc // 2, dc - (dc // 2)
+        raise ValueError(f'trying to {mode} from size {x_size} to size {size}')
+
+    padding = []
+    for d in reversed(range(len(x_size))):
+        pad_val = abs(x_size[d] - size[d])
+        padding.append(pad_val // 2)
+        padding.append(pad_val - (pad_val // 2))
+
     if mode == 'pad':
-        return nn.functional.pad(x, [dc1, dc2, dr1, dr2, 0, 0, 0, 0])
+        return nn.functional.pad(x, padding)
     elif mode == 'crop':
-        return x[:, :, dr1:x_size[0] - dr2, dc1:x_size[1] - dc2]
+        if len(x_size) == 2:
+            return x[:, :, padding[2]:x_size[0] - padding[3], padding[0]:x_size[1] - padding[1]]
+        elif len(x_size) == 3:
+            return x[:, :, padding[4]:x_size[0] - padding[5], padding[2]:x_size[1] - padding[3],
+                   padding[0]:x_size[2] - padding[1]]
     
 
 def free_bits_kl(kl,

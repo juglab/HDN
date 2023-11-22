@@ -1,5 +1,11 @@
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint, checkpoint_sequential
+from typing import Type, Union
+
+
+def no_cp(func, inp):
+    return func(inp)
 
 
 class ResidualBlock(nn.Module):
@@ -25,78 +31,86 @@ class ResidualBlock(nn.Module):
 
     def __init__(self,
                  channels,
+                 conv_mult,
                  nonlin,
                  kernel=None,
                  groups=1,
                  batchnorm=True,
                  block_type=None,
                  dropout=None,
-                 gated=None):
+                 gated=None,
+                 grad_checkpoint=False):
         super().__init__()
         if kernel is None:
             kernel = self.default_kernel_size
         elif isinstance(kernel, int):
             kernel = (kernel, kernel)
         elif len(kernel) != 2:
-            raise ValueError(
-                "kernel has to be None, int, or an iterable of length 2")
+            raise ValueError("kernel has to be None, int, or an iterable of length 2")
         assert all([k % 2 == 1 for k in kernel]), "kernel sizes have to be odd"
         kernel = list(kernel)
         pad = [k // 2 for k in kernel]
-        self.gated = gated
+        dropout = dropout if not grad_checkpoint else None
+        self.cp = checkpoint if grad_checkpoint else no_cp
+        #TODO Might need to update batchnorm stats calculation for grad checkpointing
 
+        conv_layer: Type[Union[nn.Conv2d, nn.Conv3d]] = getattr(nn, f'Conv{conv_mult}d')
+        batchnorm_layer_type: Type[Union[nn.BatchNorm2d, nn.BatchNorm3d]] = getattr(nn, f'BatchNorm{conv_mult}d')
+        dropout_layer_type: Type[Union[nn.Dropout2d, nn.Dropout3d]] = getattr(nn, f'Dropout{conv_mult}d')
         modules = []
 
         if block_type == 'cabdcabd':
             for i in range(2):
-                conv = nn.Conv2d(channels,
-                                 channels,
-                                 kernel[i],
-                                 padding=pad[i],
-                                 groups=groups)
+                conv = conv_layer(channels,
+                                  channels,
+                                  kernel[i],
+                                  padding=pad[i],
+                                  groups=groups)
                 modules.append(conv)
                 modules.append(nonlin())
                 if batchnorm:
-                    modules.append(nn.BatchNorm2d(channels))
+                    modules.append(batchnorm_layer_type(channels))
                 if dropout is not None:
-                    modules.append(nn.Dropout2d(dropout))
+                    modules.append(dropout_layer_type(dropout))
 
         elif block_type == 'bacdbac':
             for i in range(2):
                 if batchnorm:
-                    modules.append(nn.BatchNorm2d(channels))
+                    modules.append(batchnorm_layer_type(channels))
                 modules.append(nonlin())
-                conv = nn.Conv2d(channels,
-                                 channels,
-                                 kernel[i],
-                                 padding=pad[i],
-                                 groups=groups)
+                conv = conv_layer(channels,
+                                  channels,
+                                  kernel[i],
+                                  padding=pad[i],
+                                  groups=groups)
                 modules.append(conv)
                 if dropout is not None and i == 0:
-                    modules.append(nn.Dropout2d(dropout))
+                    modules.append(dropout_layer_type(dropout))
 
         elif block_type == 'bacdbacd':
             for i in range(2):
                 if batchnorm:
-                    modules.append(nn.BatchNorm2d(channels))
+                    modules.append(batchnorm_layer_type(channels))
                 modules.append(nonlin())
-                conv = nn.Conv2d(channels,
-                                 channels,
-                                 kernel[i],
-                                 padding=pad[i],
-                                 groups=groups)
+                conv = conv_layer(channels,
+                                  channels,
+                                  kernel[i],
+                                  padding=pad[i],
+                                  groups=groups)
                 modules.append(conv)
-                modules.append(nn.Dropout2d(dropout))
+                if dropout is not None:
+                    modules.append(dropout_layer_type(dropout))
 
         else:
             raise ValueError("unrecognized block type '{}'".format(block_type))
 
         if gated:
-            modules.append(GateLayer2d(channels, 1, nonlin))
+            modules.append(GateLayer(channels, 1, conv_layer, nonlin))
         self.block = nn.Sequential(*modules)
 
-    def forward(self, x):
-        return self.block(x) + x
+    def forward(self, inp):
+        return self.cp(self.block, inp) + inp
+        
 
 
 class ResidualGatedBlock(ResidualBlock):
@@ -105,17 +119,17 @@ class ResidualGatedBlock(ResidualBlock):
         super().__init__(*args, **kwargs, gated=True)
 
 
-class GateLayer2d(nn.Module):
+class GateLayer(nn.Module):
     """
     Double the number of channels through a convolutional layer, then use
     half the channels as gate for the other half.
     """
 
-    def __init__(self, channels, kernel_size, nonlin=nn.LeakyReLU):
+    def __init__(self, channels, kernel_size, conv_type, nonlin=nn.LeakyReLU):
         super().__init__()
         assert kernel_size % 2 == 1
         pad = kernel_size // 2
-        self.conv = nn.Conv2d(channels, 2 * channels, kernel_size, padding=pad)
+        self.conv = conv_type(channels, 2 * channels, kernel_size, padding=pad)
         self.nonlin = nonlin()
 
     def forward(self, x):

@@ -7,11 +7,13 @@ from torch.distributions import normal
 from scipy.stats import norm
 from tifffile import imread
 
+
 def fastShuffle(series, num):
     length = series.shape[0]
     for i in range(num):
         series = series[np.random.permutation(length),:]
     return series
+
 
 class GaussianMixtureNoiseModel:
     """The GaussianMixtureNoiseModel class describes a noise model which is parameterized as a mixture of gaussians.
@@ -51,7 +53,7 @@ class GaussianMixtureNoiseModel:
     """
 
     def __init__(self, **kwargs):
-        if(kwargs.get('params') is None):
+        if (kwargs.get('params') is None):
             weight=kwargs.get('weight')
             n_gaussian=kwargs.get('n_gaussian')
             n_coeff=kwargs.get('n_coeff')
@@ -80,7 +82,7 @@ class GaussianMixtureNoiseModel:
             self.max_signal=torch.Tensor(params['max_signal']).to(self.device)
             
             self.weight=torch.Tensor(params['trained_weight']).to(self.device)
-            self.min_sigma=np.asscalar(params['min_sigma'])
+            self.min_sigma=np.ndarray.item(params['min_sigma'])
             self.n_gaussian=self.weight.shape[0]//3
             self.n_coeff=self.weight.shape[1]
             self.tol=torch.Tensor([1e-10]).to(self.device)
@@ -107,7 +109,7 @@ class GaussianMixtureNoiseModel:
         """
         value=0
         for i in range(weightParams.shape[0]):
-            value += weightParams[i] * (((signals - self.min_signal) / (self.max_signal - self.min_signal)) ** i);
+            value += weightParams[i] * (((signals - self.min_signal) / (self.max_signal - self.min_signal)) ** i)
         return value
         
    
