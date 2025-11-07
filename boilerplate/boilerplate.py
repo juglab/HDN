@@ -84,8 +84,7 @@ def _make_optimizer_and_scheduler(model, lr, weight_decay) -> Optimizer:
                                                      'min',
                                                       patience=10,
                                                       factor=0.5,
-                                                      min_lr=1e-12,
-                                                      verbose=True)
+                                                      min_lr=1e-12)
     return optimizer, scheduler
         
 def forward_pass(x, y, device, model, gaussian_noise_std)-> dict:

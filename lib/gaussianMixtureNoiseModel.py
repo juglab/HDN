@@ -58,7 +58,7 @@ class GaussianMixtureNoiseModel:
             min_signal=kwargs.get('min_signal')
             max_signal=kwargs.get('max_signal')
             self.device=kwargs.get('device')
-            self.path=kwargs.get('path')
+            self.path=str(kwargs.get('path'))
             self.min_sigma=kwargs.get('min_sigma')
             if (weight is None):
                 weight = np.random.randn(n_gaussian * 3, n_coeff)
@@ -80,7 +80,7 @@ class GaussianMixtureNoiseModel:
             self.max_signal=torch.Tensor(params['max_signal']).to(self.device)
             
             self.weight=torch.Tensor(params['trained_weight']).to(self.device)
-            self.min_sigma=np.asscalar(params['min_sigma'])
+            self.min_sigma=params['min_sigma'].item()
             self.n_gaussian=self.weight.shape[0]//3
             self.n_coeff=self.weight.shape[1]
             self.tol=torch.Tensor([1e-10]).to(self.device)
